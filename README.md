@@ -7,6 +7,13 @@ Box Drive（などの同期フォルダ）を **ただのファイルツリー**
 - 履歴は手元の git だけが持つ
 - **Box 側が、手元の基準（最後に pull/push した状態）より更新されていたら push を失敗させる**
 
+## チュートリアル
+
+- [チュートリアル 1: Box Drive の資料を git で更新する（日常の使い方）](docs/tutorial-basic.md)
+  — 1 つの Box フォルダを相手に、取り込み・編集・反映・競合解決・過去の版への復元を行う流れ
+- [チュートリアル 2: 複数の Box フォルダを submodule で束ね、AI に資料を更新させる](docs/tutorial-advanced.md)
+  — 参照用／更新対象の Box フォルダを submodule で管理し、AI（Claude Code）が編集、Box への反映だけ人間が承認する運用
+
 ## 導入
 
 ### かんたんな方法（おすすめ）

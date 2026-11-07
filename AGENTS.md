@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `git-remote-boxdrive` is a single-file bash git remote helper (`boxdrive::<path>` URLs) that treats a Box Drive (or any synced) folder as a **plain file tree** remote. The remote folder holds only ordinary files — no `.git`, no bundles, no metadata. History lives only in local repos. Target environment is Git for Windows (git + bundled bash/find); no other dependencies may be introduced.
 
-User-facing docs and code comments/messages are in Japanese; keep that convention.
+User-facing docs and code comments/messages are in Japanese; keep that convention. Tutorials live in `docs/` (`tutorial-basic.md`: single Box folder daily workflow; `tutorial-advanced.md`: multiple Box folders as submodules with AI edits and human-approved push) — update them when user-visible behavior or messages change.
 
 ## Commands
 

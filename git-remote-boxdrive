@@ -1,0 +1,266 @@
+#!/bin/bash
+# git-remote-boxdrive: Box Drive（などの同期フォルダ）を「ただのファイルツリー」として扱う git remote helper
+#
+# 依存: git と、Git for Windows 同梱の bash / find（追加インストール不要）
+#
+# 使い方:
+#   git remote add box boxdrive::/c/Users/me/Box/project      (Git Bash のパス表記)
+#   git remote add box boxdrive::C:/Users/me/Box/project      (Windows 表記でも可)
+#   git clone boxdrive::/c/Users/me/Box/project work
+#
+# 仕組み:
+#   - リモート側（Box）には普通のファイルだけを置く。履歴やメタ情報は置かない。
+#   - list のたびに Box のフォルダ全体を tree 化し、前回把握した状態(refs/box-state/*)と比べる。
+#       同じ   -> 前回のコミットをそのまま「リモートの先頭」として返す
+#       違う   -> Box 上の変更を取り込んだ合成コミット（親=前回の状態）を作って返す
+#   - push は「Box の現在状態 == 前回 pull/push した状態」のときだけ許可する。
+#       Box 側が手元の基準より変わっていたら失敗（fetch first）。
+#   - 強制 push による上書きは拒否する。
+#
+# 制限: Box には排他制御がないため、同時 push の競合窓は完全には消えない（push 後に再検証して警告する）。
+
+set -u
+set -o pipefail
+
+EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
+BRANCH="${BOX_BRANCH:-main}"
+REMOTE_NAME="${1:-box}"
+URL="${2:-$1}"
+
+log() { printf 'git-remote-boxdrive: %s\n' "$*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+
+# ---- URL -> ディレクトリ ---------------------------------------------------
+BOX_DIR="$URL"
+BOX_DIR="${BOX_DIR#boxdrive::}"
+BOX_DIR="${BOX_DIR#box::}"
+BOX_DIR="${BOX_DIR#box://}"
+# box:///C:/x や box://C:/x の揺れを吸収: "/C:/x" -> "C:/x"
+if [[ "$BOX_DIR" =~ ^/[A-Za-z]:/ ]]; then BOX_DIR="${BOX_DIR#/}"; fi
+[[ -d "$BOX_DIR" ]] || die "フォルダが見つかりません: $BOX_DIR"
+BOX_DIR="$(cd "$BOX_DIR" && pwd)" || die "フォルダに入れません: $BOX_DIR"
+
+GITDIR="$(git rev-parse --absolute-git-dir 2>/dev/null)" || die "git リポジトリ内から実行してください"
+# git は GIT_DIR を相対パス(".git")で渡すことがある。Box フォルダへ cd しても迷わないよう絶対パス化する
+export GIT_DIR="$GITDIR"
+unset GIT_WORK_TREE GIT_INDEX_FILE
+
+# 状態参照は URL ごとに分ける（リモート名を変えても追従できる）
+URL_ID="$(printf '%s' "$BOX_DIR" | git hash-object --stdin)"
+STATE_REF="refs/box-state/$URL_ID"
+
+# ---- 除外ファイル（Box/OS が勝手に作るもの） ---------------------------------
+is_ignored() {
+  local p="$1" base="${1##*/}"
+  case "$p" in
+    .git|.git/*|*/.git|*/.git/*) return 0;;
+  esac
+  case "$base" in
+    .DS_Store|desktop.ini|Thumbs.db|\~\$*|*.boxgit-tmp.*|.~lock.*#) return 0;;
+  esac
+  return 1
+}
+
+# ---- Box フォルダ全体を tree オブジェクト化して sha を返す --------------------
+snapshot_tree() {
+  local idx="$GITDIR/box-index.$$"
+  local -a paths=() shas=()
+  local f i
+
+  while IFS= read -r -d '' f; do
+    f="${f#./}"
+    is_ignored "$f" && continue
+    if [[ "$f" == *$'\n'* ]]; then log "改行を含むファイル名は無視します: $f"; continue; fi
+    paths+=("$f")
+  done < <(cd "$BOX_DIR" && find . -type f -print0)
+
+  if (( ${#paths[@]} == 0 )); then
+    printf '%s\n' "$EMPTY_TREE"
+    return 0
+  fi
+
+  # 1 プロセスでまとめて blob 化（フィルタ無し＝バイト列そのまま）
+  mapfile -t shas < <(cd "$BOX_DIR" && printf '%s\n' "${paths[@]}" | git hash-object -w --no-filters --stdin-paths) \
+    || die "ファイルの読み取りに失敗しました（Box Drive の同期中の可能性があります。少し待って再試行してください）"
+  (( ${#shas[@]} == ${#paths[@]} )) || die "ファイル読み取り数が一致しません"
+
+  rm -f "$idx"
+  {
+    for i in "${!paths[@]}"; do
+      printf '100644 %s\t%s\0' "${shas[$i]}" "${paths[$i]}"
+    done
+  } | GIT_INDEX_FILE="$idx" git update-index --add -z --index-info || { rm -f "$idx"; die "index の作成に失敗しました"; }
+
+  GIT_INDEX_FILE="$idx" git write-tree
+  local rc=$?
+  rm -f "$idx"
+  return $rc
+}
+
+head_commit() { git rev-parse -q --verify "$STATE_REF^{commit}" 2>/dev/null || true; }
+
+tree_of() { git rev-parse -q --verify "$1^{tree}"; }
+
+make_snapshot_commit() {  # $1=tree $2=parent(空可)
+  local -a parent=()
+  [[ -n "${2:-}" ]] && parent=(-p "$2")
+  GIT_AUTHOR_NAME="box" GIT_AUTHOR_EMAIL="box@localhost" \
+  GIT_COMMITTER_NAME="box" GIT_COMMITTER_EMAIL="box@localhost" \
+  git -c commit.gpgsign=false commit-tree "$1" "${parent[@]}" -m "Box snapshot: $BOX_DIR"
+}
+
+# ---- list ---------------------------------------------------------------
+do_list() {
+  local t_box head t_head c
+  t_box="$(snapshot_tree)" || die "スナップショット作成に失敗"
+  head="$(head_commit)"
+  if [[ -n "$head" ]]; then t_head="$(tree_of "$head")"; else t_head="$EMPTY_TREE"; fi
+
+  if [[ -z "$head" && "$t_box" == "$EMPTY_TREE" ]]; then
+    # 空のリモート（何も広告しない）
+    printf '\n'
+    return 0
+  fi
+
+  if [[ -z "$head" || "$t_box" != "$t_head" ]]; then
+    c="$(make_snapshot_commit "$t_box" "$head")" || die "合成コミットの作成に失敗"
+    git update-ref "$STATE_REF" "$c"
+    head="$c"
+  fi
+  printf '%s refs/heads/%s\n' "$head" "$BRANCH"
+  printf '@refs/heads/%s HEAD\n' "$BRANCH"
+  printf '\n'
+}
+
+# ---- push ---------------------------------------------------------------
+safe_path() {
+  case "/$1/" in
+    */../*|*/./*|*/.git/*) return 1;;
+  esac
+  [[ "$1" != /* && "$1" != *:* ]]
+}
+
+remove_empty_parents() {
+  local d="$BOX_DIR/$1"
+  d="${d%/*}"
+  while [[ "$d" != "$BOX_DIR" && "$d" == "$BOX_DIR"/* ]]; do
+    rmdir "$d" 2>/dev/null || break
+    d="${d%/*}"
+  done
+}
+
+push_one() {  # $1=spec ([+]src:dst)
+  local spec="$1" src dst c_src t_src t_box head t_head
+  if [[ "$spec" == +* ]]; then
+    dst="${spec#*:}"
+    printf 'error %s %s\n' "$dst" "強制 push はサポートしていません。先に git pull してください"
+    return
+  fi
+  src="${spec%%:*}"; dst="${spec#*:}"
+
+  if [[ -z "$src" ]]; then printf 'error %s %s\n' "$dst" "削除はサポートしていません"; return; fi
+  if [[ "$dst" != "refs/heads/$BRANCH" ]]; then
+    printf 'error %s %s\n' "$dst" "box にはブランチがありません。'$src:$BRANCH' のように main へ push してください"
+    return
+  fi
+  c_src="$(git rev-parse -q --verify "$src^{commit}")" || { printf 'error %s %s\n' "$dst" "コミットが解決できません: $src"; return; }
+  t_src="$(tree_of "$c_src")"
+
+  head="$(head_commit)"
+  if [[ -n "$head" ]]; then t_head="$(tree_of "$head")"; else t_head="$EMPTY_TREE"; fi
+
+  # 1) Box が基準から変わっていないか（要件の中核）
+  t_box="$(snapshot_tree)" || { printf 'error %s %s\n' "$dst" "Box のスナップショット作成に失敗"; return; }
+  if [[ "$t_box" != "$t_head" ]]; then
+    printf 'error %s %s\n' "$dst" "fetch first: Box 側が更新されています。git pull してから再度 push してください"
+    return
+  fi
+
+  # 2) 履歴の祖先関係（通常の non-fast-forward 判定）
+  if [[ -n "$head" ]] && ! git merge-base --is-ancestor "$head" "$c_src" 2>/dev/null; then
+    printf 'error %s %s\n' "$dst" "non-fast-forward: 先に git pull してください"
+    return
+  fi
+
+  # 3) 差分を Box に反映
+  local status path blob tmp n_write=0 n_del=0 bad=0
+  local -a ops=()
+  while IFS= read -r -d '' status && IFS= read -r -d '' path; do
+    ops+=("$status" "$path")
+  done < <(git diff-tree -r -z --no-renames --name-status "$t_box" "$t_src")
+
+  local k
+  for ((k=0; k<${#ops[@]}; k+=2)); do
+    safe_path "${ops[k+1]}" || { printf 'error %s %s\n' "$dst" "不正なパスを含むため中止: ${ops[k+1]}"; return; }
+  done
+
+  for ((k=0; k<${#ops[@]}; k+=2)); do
+    status="${ops[k]}"; path="${ops[k+1]}"
+    case "$status" in
+      D)
+        if rm -f -- "$BOX_DIR/$path"; then remove_empty_parents "$path"; n_del=$((n_del+1))
+        else printf 'error %s %s\n' "$dst" "削除に失敗: $path"; return; fi
+        ;;
+      A|M|T)
+        blob="$(git rev-parse -q --verify "$c_src:$path")" || { log "スキップ（取得不可）: $path"; continue; }
+        if [[ "$(git cat-file -t "$blob")" != blob ]]; then log "スキップ（blob 以外: submodule 等）: $path"; continue; fi
+        if [[ "$path" == */* ]]; then mkdir -p -- "$BOX_DIR/${path%/*}" 2>/dev/null; fi
+        tmp="$BOX_DIR/$path.boxgit-tmp.$$"
+        if git cat-file blob "$blob" > "$tmp" && mv -f -- "$tmp" "$BOX_DIR/$path"; then
+          n_write=$((n_write+1))
+        else
+          rm -f -- "$tmp"
+          printf 'error %s %s\n' "$dst" "書き込みに失敗: $path（ロック中/同期中の可能性）"; return
+        fi
+        ;;
+    esac
+  done
+
+  # 4) 事後検証（書き込み中に Box 側が変わっていないか）
+  local t_after
+  t_after="$(snapshot_tree)" || t_after=""
+  if [[ "$t_after" != "$t_src" ]]; then
+    printf 'error %s %s\n' "$dst" "反映後の検証に失敗: 書き込み中に Box が変更された可能性があります。git fetch で状態を確認してください"
+    return
+  fi
+
+  git update-ref "$STATE_REF" "$c_src"
+  log "反映完了: 書き込み $n_write / 削除 $n_del"
+  printf 'ok %s\n' "$dst"
+}
+
+do_push() {
+  local s
+  for s in "$@"; do push_one "$s"; done
+  printf '\n'
+}
+
+# ---- メインループ（remote helper プロトコル） -------------------------------
+while IFS= read -r line; do
+  case "$line" in
+    capabilities)
+      printf 'fetch\npush\n\n'
+      ;;
+    list|"list for-push")
+      do_list
+      ;;
+    fetch\ *)
+      # オブジェクトは list 時にすでにローカルへ書き込み済み
+      while IFS= read -r l && [[ -n "$l" ]]; do :; done
+      printf '\n'
+      ;;
+    push\ *)
+      specs=("${line#push }")
+      while IFS= read -r l && [[ -n "$l" ]]; do specs+=("${l#push }"); done
+      do_push "${specs[@]}"
+      ;;
+    "")
+      break
+      ;;
+    *)
+      log "未対応のコマンド: $line"
+      printf 'unsupported\n'
+      ;;
+  esac
+done
+exit 0

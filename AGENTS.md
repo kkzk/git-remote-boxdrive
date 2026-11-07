@@ -14,7 +14,7 @@ User-facing docs and code comments/messages are in Japanese; keep that conventio
 bash test.sh     # full test suite (uses a temp local folder in place of Box)
 ```
 
-There is no build or lint step. Tests are a single sequential scenario script (sections `== 1.` … `== 11.`) with shared state between sections, so individual tests cannot be run in isolation — to debug one, comment out later sections or add `exit` after the relevant section. `test.sh` prepends the repo dir to `PATH` and sets an isolated `GIT_CONFIG_GLOBAL`, so it tests the working copy of `git-remote-boxdrive` directly.
+There is no build or lint step. Tests are a single sequential scenario script (sections `== 1.` … `== 12.`) with shared state between sections, so individual tests cannot be run in isolation — to debug one, comment out later sections or add `exit` after the relevant section. `test.sh` prepends the repo dir to `PATH` and sets an isolated `GIT_CONFIG_GLOBAL`, so it tests the working copy of `git-remote-boxdrive` directly.
 
 `git-remote-boxdrive` must keep LF line endings and its executable bit. `install.cmd` / `uninstall.cmd` (double-click installers for non-technical users: copy to `%LOCALAPPDATA%\Programs\git-remote-boxdrive` and add it to the user `Path` via HKCU registry, preserving the value's type) are UTF-8 with `chcp 65001` and **must keep CRLF** — with LF, cmd misparses the Japanese lines. Editing them with `sed -i` in Git Bash can strip the CR; re-check with `file`. Line endings are pinned in `.gitattributes`.
 

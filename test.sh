@@ -110,6 +110,41 @@ cd "$T/A"; git checkout -qb feat; echo f > f.txt; git add f.txt; git commit -qm 
 expect_fail "feat ブランチ push は拒否" git push box feat
 expect_ok "feat:main は OK (pull 済みなら)" bash -c "git fetch -q box && git merge -q --no-edit box/main; git push box feat:main"
 
+echo "== 12. 複数の Box フォルダをサブモジュールとして参照"
+BOXR1="$T/fakebox/ref1"; BOXR2="$T/fakebox/ref2"; mkdir -p "$BOXR1/doc" "$BOXR2"
+echo "r1" > "$BOXR1/doc/r1.txt"; echo "r2" > "$BOXR2/r2.txt"
+git init -q "$T/W"; cd "$T/W"
+expect_fail "protocol 許可なしでは submodule add できない" git submodule add -b main "boxdrive::$BOXR1" ref1
+expect_msg "拒否理由が出る" "not allowed"
+rm -rf ref1 .git/modules/ref1
+git config --global protocol.boxdrive.allow always
+expect_ok "submodule add (ref1)" git submodule add -b main "boxdrive::$BOXR1" ref1
+expect_ok "submodule add (ref2)" git submodule add -b main "boxdrive::$BOXR2" ref2
+expect_ok "親に記録" git commit -qm "add refs"
+[[ "$(cat ref1/doc/r1.txt)" == r1 && "$(cat ref2/r2.txt)" == r2 ]] && ok "各 Box の内容が見える" || ng "サブモジュールの内容"
+echo "r1 updated" > "$BOXR1/doc/r1.txt"
+expect_ok "update --remote で Box の変更を取り込む" git submodule update --remote
+[[ "$(cat ref1/doc/r1.txt)" == "r1 updated" ]] && ok "サブモジュールに反映" || ng "サブモジュールに反映されていない"
+[[ "$(git status --porcelain ref1)" == " M ref1" ]] && ok "親から変更として見える" || ng "親の status: $(git status --porcelain)"
+expect_ok "参照状態を親に記録" git commit -qam "bump ref1"
+cd ref2; expect_ok "サブモジュールで main に切り替え" git switch -q main
+expect_ok "サブモジュール内で pull" git pull -q --no-edit
+echo "edited in W" >> r2.txt; git commit -qam "edit r2"
+expect_ok "サブモジュールから Box へ push" git push -q origin main
+cd "$T/W"
+grep -q "edited in W" "$BOXR2/r2.txt" && ok "Box に書き戻された" || ng "Box に書き戻されていない"
+expect_ok "push 後の状態を親に記録" git commit -qam "bump ref2"
+
+echo "別の場所に親を clone（合成コミットは clone ごとに作られるため、記録 SHA は再現できない）"
+cd "$T"; expect_ok "親を clone" git clone -q W W2
+cd "$T/W2"
+expect_ok "update --init --remote で最新を取得できる" git submodule update --init --remote
+[[ "$(cat ref1/doc/r1.txt)" == "r1 updated" ]] && grep -q "edited in W" ref2/r2.txt && ok "clone 先でも Box の最新内容" || ng "clone 先の内容"
+cd "$T"; git clone -q W W3; cd "$T/W3"
+expect_fail "記録 SHA での update --init は失敗する (既知の制限)" git submodule update --init
+expect_ok "失敗後は --remote --force で復旧できる" git submodule update --init --remote --force
+[[ "$(cat ref1/doc/r1.txt)" == "r1 updated" ]] && grep -q "edited in W" ref2/r2.txt && ok "復旧後の内容" || ng "復旧後の内容"
+
 echo
 echo "結果: PASS=$pass FAIL=$fail"
 [[ $fail -eq 0 ]]

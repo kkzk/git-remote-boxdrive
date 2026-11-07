@@ -81,6 +81,54 @@ Box 上の「ブランチ」は `main` ひとつだけ（`BOX_BRANCH` 環境変�
 
 最初の pull だけ履歴が無関係と判定されるため `git pull box main --allow-unrelated-histories` が必要。
 
+## 複数の Box フォルダをサブモジュールとして参照する
+
+作業用のフォルダをローカルの git リポジトリにして、参照したい Box フォルダをそれぞれサブモジュールとして取り込める。親リポジトリの履歴に「いつ、どの Box の状態を見ていたか」が残る。
+
+```bash
+# 最初に一度だけ（git はサブモジュールで未知のプロトコルを既定で拒否する）
+git config --global protocol.boxdrive.allow always
+
+git init work && cd work
+git submodule add -b main boxdrive::C:/Users/me/Box/仕様書 ref/spec
+git submodule add -b main boxdrive::C:/Users/me/Box/議事録 ref/minutes
+git commit -m "参照する Box フォルダを追加"
+```
+
+`protocol.boxdrive.allow` を設定していないと `fatal: transport 'boxdrive' not allowed` で失敗する。
+
+### Box の最新を取り込む
+
+```bash
+git submodule update --remote          # すべての Box を最新に
+git commit -am "参照中の Box を更新"     # 取り込んだ状態を親に記録（任意）
+```
+
+### サブモジュールで編集して Box に書き戻す
+
+`git submodule update` の後のサブモジュールは、どのブランチにもいない状態（detached HEAD）になっている。編集する前に `main` に切り替える。
+
+```bash
+cd ref/spec
+git switch main
+git pull
+# 編集して commit
+git push origin main
+cd ../.. && git commit -am "ref/spec を更新"
+```
+
+### 注意点
+
+- **親を別の場所に clone したら、必ず `--remote` を付ける。** Box 側には履歴が無く、Box の状態を表す合成コミットは clone ごとに作られる。そのため、親に記録されたコミットは他の clone からは取得できない。
+  ```bash
+  git clone <親リポジトリ> work2 && cd work2
+  git submodule update --init --remote
+  ```
+  `--remote` なしで実行すると `did not contain <sha>` で失敗する。その場合は `git submodule update --init --remote --force` で復旧できる。
+- **親リポジトリ自体は boxdrive で Box に push できない。** サブモジュールはファイルとして表現できないため。親を共有・バックアップするなら、通常の git リモートを使う。
+- `.gitmodules` には自分の Box Drive のパス（ユーザー名を含む）がそのまま入る。他の人と親を共有する場合は、各自 `git config submodule.<名前>.url boxdrive::<自分のパス>` で上書きしてもらう。
+- サブモジュールごとに list のたびに Box フォルダ全体を読むため、大きなフォルダを多数つなぐと `update --remote` が遅くなる。
+
 ## 関連する先行事例
 
 [git-annex の Box.com 向けガイド](https://git-annex.branchable.com/tips/using_box.com_as_a_special_remote/)には、Box を WebDAV 経由の special remote として使う例がある。また、[git-remote-annex](https://git-annex.branchable.com/git-remote-annex/)を使うと、git-annex の special remote に保存した Git リポジトリを `annex::` URL で clone/pull/push できる。
